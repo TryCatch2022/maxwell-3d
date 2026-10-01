@@ -14,7 +14,7 @@ use pw::types::ObjectType;
 
 use filter::HeadFilter;
 use orientation::{Direction, Quat};
-use source::{FakeRotation, OrientationSource};
+use source::{FakeRotation, MaxwellHid, OpenTrackUdp, OrientationSource};
 
 /// Spatializer nodes in `pipewire/maxwell-3d-sink.conf` and their room positions.
 const SPEAKERS: [(&str, f64); 7] = [
@@ -27,27 +27,54 @@ const SPEAKERS: [(&str, f64); 7] = [
     ("spRR", 210.0),
 ];
 
+enum SourceKind {
+    Fake,
+    OpenTrack,
+    Maxwell,
+}
+
 struct Args {
     node_name: String,
+    source: SourceKind,
+    listen: std::net::SocketAddr,
+    hidraw: Option<std::path::PathBuf>,
     rate_hz: f64,
     speed: f64,
     smoothing_ms: f64,
+    deadband_deg: f64,
 }
 
 fn parse_args() -> Args {
     let mut args = Args {
         node_name: "effect_input.maxwell_3d".into(),
+        source: SourceKind::Fake,
+        listen: ([127, 0, 0, 1], 4242).into(),
+        hidraw: None,
         rate_hz: 30.0,
         speed: 20.0,
         smoothing_ms: 30.0,
+        deadband_deg: 1.0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = || it.next().unwrap_or_else(|| usage(&format!("{arg} needs a value")));
         match arg.as_str() {
             "--node" => args.node_name = value(),
+            "--source" => {
+                args.source = match value().as_str() {
+                    "fake" => SourceKind::Fake,
+                    "opentrack" => SourceKind::OpenTrack,
+                    "maxwell" => SourceKind::Maxwell,
+                    other => usage(&format!("unknown source {other}")),
+                }
+            }
+            "--listen" => args.listen = value().parse().unwrap_or_else(|_| usage("bad --listen")),
+            "--hidraw" => args.hidraw = Some(value().into()),
             "--rate" => args.rate_hz = value().parse().unwrap_or_else(|_| usage("bad --rate")),
             "--speed" => args.speed = value().parse().unwrap_or_else(|_| usage("bad --speed")),
+            "--deadband" => {
+                args.deadband_deg = value().parse().unwrap_or_else(|_| usage("bad --deadband"))
+            }
             "--smoothing" => {
                 args.smoothing_ms = value().parse().unwrap_or_else(|_| usage("bad --smoothing"))
             }
@@ -59,7 +86,11 @@ fn parse_args() -> Args {
 
 fn usage(error: &str) -> ! {
     eprintln!("error: {error}");
-    eprintln!("usage: maxwell3d [--node NAME] [--rate HZ] [--speed DEG_PER_SEC] [--smoothing MS]");
+    eprintln!(
+        "usage: maxwell3d [--source fake|opentrack|maxwell] [--listen ADDR:PORT]\n\
+         \x20                [--hidraw PATH] [--node NAME] [--rate HZ]\n\
+         \x20                [--speed DEG_PER_SEC] [--smoothing MS] [--deadband DEG]"
+    );
     eprintln!("send SIGUSR1 to make the current heading the new front");
     std::process::exit(2);
 }
@@ -144,8 +175,36 @@ fn main() -> Result<(), pw::Error> {
         })
         .register();
 
-    let source: RefCell<Box<dyn OrientationSource>> =
-        RefCell::new(Box::new(FakeRotation::new(args.speed)));
+    let source: Box<dyn OrientationSource> = match args.source {
+        SourceKind::Fake => Box::new(FakeRotation::new(args.speed)),
+        SourceKind::OpenTrack => match OpenTrackUdp::bind(args.listen) {
+            Ok(source) => {
+                eprintln!("listening for OpenTrack UDP on {}", args.listen);
+                Box::new(source)
+            }
+            Err(e) => {
+                eprintln!("cannot listen on {}: {e}", args.listen);
+                std::process::exit(1);
+            }
+        },
+        SourceKind::Maxwell => {
+            let Some(path) = args.hidraw.clone().or_else(MaxwellHid::find) else {
+                eprintln!("no Audeze Maxwell headset found (plug it in over USB-C)");
+                std::process::exit(1);
+            };
+            match MaxwellHid::open(&path) {
+                Ok(source) => {
+                    eprintln!("head tracking from {}", path.display());
+                    Box::new(source)
+                }
+                Err(e) => {
+                    eprintln!("cannot open {}: {e}", path.display());
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+    let source = RefCell::new(source);
     let filter = Rc::new(RefCell::new(HeadFilter::new(args.smoothing_ms / 1000.0)));
     // Set on SIGINT/SIGTERM: stop tracking, the speakers are being reset.
     let exiting = Rc::new(Cell::new(false));
@@ -155,16 +214,27 @@ fn main() -> Result<(), pw::Error> {
         let filter = filter.clone();
         let exiting = exiting.clone();
         let last = Cell::new(Instant::now());
+        // Keep feeding the last pose between tracker packets so smoothing settles.
+        let last_raw = Cell::new(None);
+        let last_sent = Cell::new(None);
+        let deadband = args.deadband_deg;
         move |_| {
             if exiting.get() {
                 return;
             }
-            let Some(raw) = source.borrow_mut().poll() else { return };
+            let Some(raw) = source.borrow_mut().poll().or(last_raw.get()) else { return };
+            last_raw.set(Some(raw));
             let now = Instant::now();
             let dt = now.duration_since(last.replace(now)).as_secs_f64();
             let head = filter.borrow_mut().update(raw, dt);
+            // Every change makes the spatializers reload their filters without
+            // a crossfade, which clicks: ignore tracker jitter below the deadband.
+            if last_sent.get().is_some_and(|sent: Quat| sent.angle_to_deg(head) < deadband) {
+                return;
+            }
             if let Some((_, proxy)) = node.borrow().as_ref() {
                 set_speakers(proxy, head);
+                last_sent.set(Some(head));
             }
         }
     });

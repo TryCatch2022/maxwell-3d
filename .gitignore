@@ -1,1 +1,6 @@
 /target
+.venv/
+__pycache__/
+/tools/webcam-tracker/face_landmarker.task
+*.pcap
+*.pcapng

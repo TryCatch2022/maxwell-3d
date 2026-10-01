@@ -1,0 +1,4 @@
+# Let the logged-in user read the Audeze Maxwell HID interfaces (headset over
+# USB-C and the wireless dongle) so maxwell3d can get head tracking data.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4baa", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4ba9", TAG+="uaccess"

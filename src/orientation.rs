@@ -75,6 +75,12 @@ impl Quat {
         .normalize()
     }
 
+    /// Angle of the rotation that takes `self` to `other`, in degrees.
+    pub fn angle_to_deg(self, other: Quat) -> f64 {
+        let dot = self.w * other.w + self.x * other.x + self.y * other.y + self.z * other.z;
+        2.0 * dot.abs().min(1.0).acos().to_degrees()
+    }
+
     /// Heading of the forward axis around the vertical, in degrees.
     pub fn yaw_deg(self) -> f64 {
         let f = self.rotate([1.0, 0.0, 0.0]);
@@ -153,6 +159,13 @@ mod tests {
         let a = Quat::from_euler_deg(350.0, 0.0, 0.0);
         let b = Quat::from_euler_deg(10.0, 0.0, 0.0);
         assert_quat(a.slerp(b, 0.5), Quat::IDENTITY);
+    }
+
+    #[test]
+    fn angle_between_poses() {
+        let a = Quat::from_euler_deg(10.0, 0.0, 0.0);
+        let b = Quat::from_euler_deg(350.0, 0.0, 0.0);
+        assert!((a.angle_to_deg(b) - 20.0).abs() < 1e-9);
     }
 
     #[test]
