@@ -189,7 +189,7 @@ fn main() -> Result<(), pw::Error> {
         },
         SourceKind::Maxwell => {
             let Some(path) = args.hidraw.clone().or_else(MaxwellHid::find) else {
-                eprintln!("no Audeze Maxwell headset found (plug it in over USB-C)");
+                eprintln!("no Audeze Maxwell headset or dongle found");
                 std::process::exit(1);
             };
             match MaxwellHid::open(&path) {

@@ -54,16 +54,16 @@ the screen), `pkill -USR1 maxwell3d` re-centres the heading only.
 
 ### Head tracking from the Maxwell
 
-With the headset plugged in over USB-C (in USB audio mode):
+Works with the headset plugged in over USB-C (in USB audio mode) or
+wirelessly through the dongle:
 
     cargo run --release -- --source maxwell
 
 This switches the headset's head tracking stream on (the same register write
 the Windows apps make) and switches it off again on exit. Your pose when it
-starts is "front". The stream is found automatically; `--hidraw /dev/hidrawN`
-picks a node by hand. Reading the hidraw node needs
-`udev/70-audeze-maxwell.rules` in `/etc/udev/rules.d/`. Head tracking through
-the wireless dongle has not been tried yet.
+starts is "front". When both are plugged in the dongle is used, unless the
+headset on USB-C is in USB audio mode (it isn't while the dongle is connected); `--hidraw /dev/hidrawN` picks a node by hand. Reading the
+hidraw nodes needs `udev/70-audeze-maxwell.rules` in `/etc/udev/rules.d/`.
 
 Then play surround audio into the sink, for example:
 

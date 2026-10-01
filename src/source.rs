@@ -71,43 +71,75 @@ impl OrientationSource for OpenTrackUdp {
     }
 }
 
-/// Head tracking from the Audeze Maxwell over its vendor HID interface.
+/// Head tracking from the Audeze Maxwell over its vendor HID interface, either
+/// on the headset itself (USB-C) or through the wireless dongle.
 ///
-/// Learned from a USB capture of the Windows apps (headset on USB-C, in USB
-/// audio mode): writing 0x3c then 0xfc to register 0x092e starts a stream of
-/// input report 0x0A at ~60 Hz, four little-endian f32 (x, y, z, w) forming
-/// the head-to-world rotation in the headset's frame (x down, y left,
-/// z forward); writing 0x3c stops it.
+/// Learned from USB captures of the Windows apps: writing 0x3c then 0xfc to
+/// register 0x092e starts a stream of input report 0x0A at ~60 Hz, four
+/// little-endian f32 (x, y, z, w) forming the head-to-world rotation in the
+/// headset's frame (x down, y left, z forward); writing 0x3c stops it.
+/// Through the dongle the commands carry a flag asking it to forward them.
 pub struct MaxwellHid {
     file: File,
+    route: u8,
     /// First orientation of the stream: the head pose that counts as "level, facing front".
     reference: Option<Quat>,
 }
 
-const AUDEZE_HEADSET: &str = "00003329:00004BAA";
+/// HID IDs and the routing byte of the commands: 0x80 makes the dongle
+/// forward them to the headset (it rejects them otherwise).
+const AUDEZE_DEVICES: [(&str, u8); 2] = [("00003329:00004BAA", 0x00), ("00003329:00004BA9", 0x80)];
 /// Head tracking register; bits 0xc0 switch the report 0x0A stream on.
 const TRACKING_ON: [u8; 2] = [0x3c, 0xfc];
 const TRACKING_OFF: u8 = 0x3c;
 
+/// The routing byte for a hidraw node such as `hidraw3`, if it is a Maxwell.
+fn maxwell_route(node: &std::ffi::OsStr) -> Option<u8> {
+    let uevent = fs::read_to_string(Path::new("/sys/class/hidraw").join(node).join("device/uevent")).ok()?;
+    let id = uevent.lines().find_map(|l| l.strip_prefix("HID_ID=0003:"))?;
+    AUDEZE_DEVICES.iter().find(|(known, _)| *known == id).map(|&(_, route)| route)
+}
+
+/// Whether the USB device behind a hidraw node also has audio interfaces.
+/// The headset on USB-C only does (and only streams head tracking there) in
+/// USB audio mode; while it is connected to the dongle it is HID-only.
+fn has_usb_audio(node: &std::ffi::OsStr) -> bool {
+    let Ok(hid) = fs::canonicalize(Path::new("/sys/class/hidraw").join(node).join("device")) else {
+        return false;
+    };
+    // .../<usb device>/<interface>/<hid device>
+    let Some(usb_device) = hid.parent().and_then(Path::parent) else { return false };
+    let Ok(entries) = fs::read_dir(usb_device) else { return false };
+    entries.flatten().any(|e| {
+        fs::read_to_string(e.path().join("bInterfaceClass")).is_ok_and(|class| class.trim() == "01")
+    })
+}
+
 impl MaxwellHid {
-    /// The hidraw node of the headset (USB-C), if one is plugged in.
+    /// The hidraw node to use: the headset if it is on USB-C in USB audio
+    /// mode, else the dongle, else the headset anyway.
     pub fn find() -> Option<PathBuf> {
-        let mut nodes: Vec<_> = fs::read_dir("/sys/class/hidraw").ok()?.flatten().collect();
-        nodes.sort_by_key(|e| e.file_name());
-        nodes.into_iter().find_map(|entry| {
-            let uevent = fs::read_to_string(entry.path().join("device/uevent")).ok()?;
-            let is_headset = uevent.lines().any(|l| l == format!("HID_ID=0003:{AUDEZE_HEADSET}"));
-            is_headset.then(|| Path::new("/dev").join(entry.file_name()))
-        })
+        let mut nodes: Vec<_> = fs::read_dir("/sys/class/hidraw").ok()?.flatten().map(|e| e.file_name()).collect();
+        nodes.sort();
+        let rank = |node: &std::ffi::OsStr| match maxwell_route(node)? {
+            0x00 if has_usb_audio(node) => Some(0),
+            0x00 => Some(2),
+            _ => Some(1),
+        };
+        let best = nodes.iter().filter_map(|node| Some((rank(node)?, node))).min_by_key(|&(rank, _)| rank)?;
+        Some(Path::new("/dev").join(best.1))
     }
 
     pub fn open(path: &Path) -> io::Result<Self> {
+        let route = path.file_name().and_then(maxwell_route).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "not an Audeze Maxwell headset or dongle")
+        })?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .custom_flags(libc::O_NONBLOCK)
             .open(path)?;
-        let mut source = MaxwellHid { file, reference: None };
+        let mut source = MaxwellHid { file, route, reference: None };
         for value in TRACKING_ON {
             source.write_register(value)?;
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -115,13 +147,17 @@ impl MaxwellHid {
         Ok(source)
     }
 
-    /// Output report 0x06: [0x06, 4 + len, 0, 0x05, 0x5a, len (LE16), payload],
-    /// with the write payload being [0x00, 0x09, register, 0x00, value].
     fn write_register(&mut self, value: u8) -> io::Result<()> {
-        let mut report = [0u8; 62];
-        report[..12].copy_from_slice(&[0x06, 0x09, 0x00, 0x05, 0x5a, 0x05, 0x00, 0x00, 0x09, 0x2e, 0x00, value]);
-        self.file.write_all(&report)
+        self.file.write_all(&register_write_report(self.route, value))
     }
+}
+
+/// Output report 0x06: [0x06, 4 + len, route, 0x05, 0x5a, len (LE16), payload],
+/// with the write payload being [0x00, 0x09, register, 0x00, value].
+fn register_write_report(route: u8, value: u8) -> [u8; 62] {
+    let mut report = [0u8; 62];
+    report[..12].copy_from_slice(&[0x06, 0x09, route, 0x05, 0x5a, 0x05, 0x00, 0x00, 0x09, 0x2e, 0x00, value]);
+    report
 }
 
 impl OrientationSource for MaxwellHid {
@@ -183,6 +219,13 @@ mod tests {
         let pitch = |q: Quat| -q.rotate([1.0, 0.0, 0.0])[2].asin().to_degrees();
         assert!((pitch(up) + 43.0).abs() < 2.0, "up: {}", pitch(up));
         assert!((pitch(down) - 64.0).abs() < 2.0, "down: {}", pitch(down));
+    }
+
+    /// The enable writes as the Windows apps send them, on USB-C and through the dongle.
+    #[test]
+    fn register_writes_match_capture() {
+        assert_eq!(register_write_report(0x00, 0xfc)[..12], [6, 9, 0, 5, 0x5a, 5, 0, 0, 9, 0x2e, 0, 0xfc]);
+        assert_eq!(register_write_report(0x80, 0x3c)[..12], [6, 9, 0x80, 5, 0x5a, 5, 0, 0, 9, 0x2e, 0, 0x3c]);
     }
 
     #[test]
