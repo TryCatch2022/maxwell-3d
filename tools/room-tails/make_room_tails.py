@@ -10,6 +10,13 @@ keep the measured ratio. The sink plays these through fixed convolvers, which
 never reload, so head tracking doesn't make them click. The room doesn't turn
 with the head; reverb arrives from all around anyway.
 
+The room is darker than the direct sound (absorption) and has its modes in the
+bass, which colours the result once there is a fair amount of it. Unless
+--no-eq is given, one filter (the same for every speaker and ear, so spatial
+cues are kept) makes the room part's average response flat, which is the
+tonal balance of the diffuse-field equalised SADIE HRIRs: 1/3-octave smoothed, within +-10 dB, between 60 Hz and 16 kHz, keeping the
+room's level.
+
 Both files must come from the same head (D1, the KU100, has both):
 
     python3 -m venv tools/room-tails/.venv
@@ -38,6 +45,11 @@ DIRECT_BEFORE, DIRECT_AFTER = 1.0, 2.5
 CUT_START, CUT_FADE = 1.5, 1.0
 END_FADE = 10.0
 
+# Tonal correction of the room part.
+EQ_LIMIT_DB = 10.0
+EQ_LOW, EQ_HIGH = 60.0, 16000.0  # full correction in between, fading out to 0 dB an octave beyond
+EQ_TAPS = 4096
+
 
 def load(path):
     with h5py.File(path, "r") as f:
@@ -64,6 +76,44 @@ def window_energy(ir, peak, rate):
     return float(np.sum(ir[:, a:b] ** 2))
 
 
+def smooth(freqs, power, fraction=3):
+    """Mean of `power` over a 1/`fraction` octave around each frequency."""
+    cum = np.concatenate([[0.0], np.cumsum(power)])
+    half = 2 ** (1 / (2 * fraction))
+    lo = np.searchsorted(freqs, freqs / half)
+    hi = np.maximum(np.searchsorted(freqs, freqs * half, side="right"), lo + 1)
+    return (cum[hi] - cum[lo]) / (hi - lo)
+
+
+def average_power(responses, n):
+    """Power spectrum averaged over speakers and ears."""
+    return np.mean([np.abs(np.fft.rfft(r, n, axis=-1)) ** 2 for r in responses], axis=(0, 1))
+
+
+def tone_correction(rooms, rate):
+    """Minimum-phase FIR making the rooms' average response flat."""
+    n = max(r.shape[1] for r in rooms)
+    freqs = np.fft.rfftfreq(n, 1 / rate)
+    p_room = average_power(rooms, n)
+    corr = -10 * np.log10(smooth(freqs, p_room))
+    corr -= np.mean(corr[(freqs > 500) & (freqs < 1000)])  # limit relative to the mids
+    # Fade the correction out below EQ_LOW and above EQ_HIGH (over an octave).
+    octaves = np.log2(np.maximum(freqs, 1) / EQ_LOW).clip(-1, 0) + np.log2(EQ_HIGH / np.maximum(freqs, 1)).clip(-1, 0)
+    corr = np.clip(corr, -EQ_LIMIT_DB, EQ_LIMIT_DB) * (1 + octaves).clip(0, 1)
+    # Keep the room's level (200 Hz - 8 kHz), so the direct/room balance holds.
+    band = (freqs > 200) & (freqs < 8000)
+    corr -= 10 * np.log10(np.sum(p_room[band] * 10 ** (corr[band] / 10)) / np.sum(p_room[band]))
+    # Minimum phase from the magnitude via the real cepstrum.
+    log_mag = np.concatenate([corr, corr[-2:0:-1]]) * np.log(10) / 20
+    cep = np.fft.ifft(log_mag).real
+    fold = np.zeros_like(cep)
+    fold[0], fold[n // 2] = cep[0], cep[n // 2]
+    fold[1:n // 2] = 2 * cep[1:n // 2]
+    fir = np.fft.ifft(np.exp(np.fft.fft(fold))).real[:EQ_TAPS]
+    fir[-EQ_TAPS // 8:] *= np.hanning(EQ_TAPS // 4)[EQ_TAPS // 8:]
+    return fir, freqs, corr
+
+
 def write_float_wav(path, data, rate):
     """Stereo 32-bit float WAV (format tag 3); `data` is 2 x N."""
     frames = data.T.astype("<f4").tobytes()
@@ -81,6 +131,7 @@ def main():
     ap.add_argument("hrir", help="anechoic HRIR SOFA file used by the spatializers")
     ap.add_argument("brir", help="BRIR SOFA file of the same head")
     ap.add_argument("out", help="output directory")
+    ap.add_argument("--no-eq", action="store_true", help="leave the room part's tonal balance as measured")
     args = ap.parse_args()
 
     hrir, hpos, hrate = load(args.hrir)
@@ -91,6 +142,9 @@ def main():
     ms = lambda t: int(round(t * rate / 1000))
     os.makedirs(args.out, exist_ok=True)
 
+    end_fade = np.ones(brir.shape[-1])
+    end_fade[-ms(END_FADE):] = np.linspace(1, 0, ms(END_FADE))
+    directs, rooms = [], []
     for name, azimuth in SPEAKERS:
         b = brir[nearest(bpos, azimuth)]
         h = hrir[nearest(hpos, azimuth)]
@@ -102,8 +156,7 @@ def main():
         fade = ms(CUT_FADE)
         gate[start:start + fade] = 0.5 - 0.5 * np.cos(np.linspace(0, np.pi, fade))
         gate[start + fade:] = 1.0
-        gate[-ms(END_FADE):] *= np.linspace(1, 0, ms(END_FADE))
-        room = b * gate
+        room = b * gate * end_fade
 
         # Same direct-to-room ratio as measured, at the HRIR's level and timing.
         scale = np.sqrt(window_energy(h, h_peak, rate) / window_energy(b, b_peak, rate))
@@ -113,11 +166,24 @@ def main():
             out[:, shift:] = room[:, : room.shape[1] - shift]
         else:
             out[:, :shift] = room[:, -shift:]
-        out *= scale
+        directs.append(h)
+        rooms.append(out * scale)
 
+    if not args.no_eq:
+        fir, freqs, corr = tone_correction(rooms, rate)
+        n = rooms[0].shape[1]
+        size = n + len(fir)
+        rooms = [np.fft.irfft(np.fft.rfft(r, size, axis=-1) * np.fft.rfft(fir, size), size, axis=-1)[:, :n] * end_fade
+                 for r in rooms]
+        at = lambda f: corr[np.argmin(np.abs(freqs - f))]
+        print("room tonal correction: " + ", ".join(
+            f"{f if f < 1000 else f // 1000}{'' if f < 1000 else 'k'} {at(f):+.1f}"
+            for f in (60, 100, 150, 200, 300, 500, 1000, 2000, 4000, 8000, 12000, 16000)) + " dB")
+
+    for (name, azimuth), h, out in zip(SPEAKERS, directs, rooms):
         path = os.path.join(args.out, f"room_{name}.wav")
         write_float_wav(path, out, rate)
-        direct = window_energy(h, h_peak, rate)
+        direct = window_energy(h, onset(h), rate)
         ratio = 10 * np.log10(np.sum(out ** 2) / direct)
         print(f"{name}: BRIR at {bpos[nearest(bpos, azimuth)][0]:.0f} deg, room {ratio:+.1f} dB vs direct -> {path}")
 

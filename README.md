@@ -57,8 +57,9 @@ win the comparison by default.
 
 The HRTF spatializers are anechoic. Reflections and reverb from a real room
 (SADIE II D1's BRIRs, the same KU100 head) are added through fixed convolvers,
-which don't follow the head and so never click. Generate their impulse
-responses once:
+which don't follow the head and so never click. The room alone is dark and
+boomy, so the script equalises it flat (`--no-eq` to skip). Generate the
+impulse responses once:
 
     curl -L -o /tmp/D1_BRIR.zip 'https://zenodo.org/records/12092466/files/D1_BRIR_SOFA.zip?download=1'
     mkdir -p ~/.local/share/pipewire/hrtf-sofa/room
@@ -73,8 +74,8 @@ responses once:
 The `outL`/`outR` mixers set the balance: `Gain 1` is the direct sound,
 `Gain 2` the room. The default is 0.5 / 2.0, four times the measured room
 (which is fairly dry) at the same overall level as without room; full-scale
-stereo then peaks at -2.6 dBFS in the worst case. The room part dominates the
-peaks: going above `Gain 2` = 2 can clip. Can be changed while playing:
+stereo then peaks at -9 dBFS in the worst case, so there is room to go up.
+Can be changed while playing:
 
     pw-cli set-param effect_input.maxwell_3d Props '{ params = [ "outL:Gain 2" 0.0 "outR:Gain 2" 0.0 ] }'   # dry
 
