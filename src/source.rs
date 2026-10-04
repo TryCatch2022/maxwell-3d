@@ -6,13 +6,19 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::orientation::Quat;
 
 pub trait OrientationSource {
     /// Latest head orientation, or `None` if nothing new is available.
     fn poll(&mut self) -> Option<Quat>;
+
+    /// Whether orientations are coming in. When it turns true again the
+    /// tracker may have lost its frame, and the head is re-centred.
+    fn connected(&self) -> bool {
+        true
+    }
 }
 
 /// Turns the head slowly around the vertical axis, forever.
@@ -79,12 +85,28 @@ impl OrientationSource for OpenTrackUdp {
 /// little-endian f32 (x, y, z, w) forming the head-to-world rotation in the
 /// headset's frame (x down, y left, z forward); writing 0x3c stops it.
 /// Through the dongle the commands carry a flag asking it to forward them.
+///
+/// Survives the headset or dongle coming and going: a node that disappears is
+/// looked for again, and when the stream stops (headset off or out of range,
+/// the dongle stays) tracking is switched on again until it resumes.
 pub struct MaxwellHid {
-    file: File,
-    route: u8,
+    /// Node given with --hidraw; otherwise the best one present is used.
+    fixed: Option<PathBuf>,
+    device: Option<Device>,
+    /// When to look for a node, or re-enable a silent stream, next.
+    next_attempt: Instant,
+    last_report: Option<Instant>,
     /// First orientation of the stream: the head pose that counts as "level, facing front".
     reference: Option<Quat>,
+    /// Last problem logged, so that retries don't repeat it.
+    last_problem: Option<String>,
 }
+
+/// The stream runs at ~60 Hz even when the head is still: this long without a
+/// report means the headset is off, out of range or has stopped streaming.
+const STALE: Duration = Duration::from_secs(2);
+/// How often to look for a node, or try to restart a stale stream.
+const RETRY: Duration = Duration::from_secs(3);
 
 /// HID IDs and the routing byte of the commands: 0x80 makes the dongle
 /// forward them to the headset (it rejects them otherwise).
@@ -116,6 +138,17 @@ fn has_usb_audio(node: &std::ffi::OsStr) -> bool {
 }
 
 impl MaxwellHid {
+    pub fn new(fixed: Option<PathBuf>) -> Self {
+        MaxwellHid {
+            fixed,
+            device: None,
+            next_attempt: Instant::now(),
+            last_report: None,
+            reference: None,
+            last_problem: None,
+        }
+    }
+
     /// The hidraw node to use: the headset if it is on USB-C in USB audio
     /// mode, else the dongle, else the headset anyway.
     pub fn find() -> Option<PathBuf> {
@@ -130,7 +163,72 @@ impl MaxwellHid {
         Some(Path::new("/dev").join(best.1))
     }
 
-    pub fn open(path: &Path) -> io::Result<Self> {
+    /// Log `message` unless it is the one logged last.
+    fn problem(&mut self, message: String) {
+        if self.last_problem.as_ref() != Some(&message) {
+            eprintln!("{message}");
+            self.last_problem = Some(message);
+        }
+    }
+
+    fn connect(&mut self) {
+        let Some(path) = self.fixed.clone().or_else(MaxwellHid::find) else {
+            self.problem("no Audeze Maxwell headset or dongle found, waiting for one".into());
+            return;
+        };
+        let mut device = match Device::open(&path) {
+            Ok(device) => device,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                self.problem(format!(
+                    "cannot open {}: {e} (is udev/70-audeze-maxwell.rules installed?)",
+                    path.display()
+                ));
+                return;
+            }
+            Err(e) => {
+                self.problem(format!("cannot open {}: {e}", path.display()));
+                return;
+            }
+        };
+        eprintln!("using {}", path.display());
+        self.last_problem = None;
+        if let Err(e) = device.start_tracking() {
+            // Kept anyway: retried while no data comes.
+            self.problem(format!("cannot switch head tracking on through {}: {e}", path.display()));
+        }
+        self.device = Some(device);
+        self.last_report = None;
+    }
+
+    /// Called while the stream is silent: move to a better node if one
+    /// appeared (e.g. the headset was plugged in), else ask for the stream again.
+    fn restart_stream(&mut self) {
+        let Some(device) = &mut self.device else { return };
+        if self.fixed.is_none() && MaxwellHid::find().is_some_and(|best| best != device.path) {
+            self.device = None;
+            self.connect();
+            return;
+        }
+        let path = device.path.display().to_string();
+        let result = device.start_tracking();
+        match result {
+            Ok(()) => self.problem(format!("no head tracking data from {path} (headset off or out of range?)")),
+            Err(e) => self.problem(format!("cannot switch head tracking on through {path}: {e}")),
+        }
+    }
+}
+
+/// An open hidraw node of a headset or dongle.
+struct Device {
+    file: File,
+    path: PathBuf,
+    route: u8,
+    /// Cleared once the node has failed, so nothing more is written to it.
+    present: bool,
+}
+
+impl Device {
+    fn open(path: &Path) -> io::Result<Self> {
         let route = path.file_name().and_then(maxwell_route).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "not an Audeze Maxwell headset or dongle")
         })?;
@@ -139,16 +237,30 @@ impl MaxwellHid {
             .write(true)
             .custom_flags(libc::O_NONBLOCK)
             .open(path)?;
-        let mut source = MaxwellHid { file, route, reference: None };
+        Ok(Device { file, path: path.to_owned(), route, present: true })
+    }
+
+    fn start_tracking(&mut self) -> io::Result<()> {
         for value in TRACKING_ON {
-            source.write_register(value)?;
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            self.write_register(value)?;
+            std::thread::sleep(Duration::from_millis(100));
         }
-        Ok(source)
+        Ok(())
     }
 
     fn write_register(&mut self, value: u8) -> io::Result<()> {
         self.file.write_all(&register_write_report(self.route, value))
+    }
+}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        if !self.present {
+            return;
+        }
+        if let Err(e) = self.write_register(TRACKING_OFF) {
+            eprintln!("could not switch Maxwell head tracking off: {e}");
+        }
     }
 }
 
@@ -162,13 +274,56 @@ fn register_write_report(route: u8, value: u8) -> [u8; 62] {
 
 impl OrientationSource for MaxwellHid {
     fn poll(&mut self) -> Option<Quat> {
+        let now = Instant::now();
+        let was_connected = self.connected();
+        let Some(device) = &mut self.device else {
+            if now >= self.next_attempt {
+                self.next_attempt = now + RETRY;
+                self.connect();
+            }
+            return None;
+        };
         let mut latest = None;
         let mut buf = [0u8; 64];
-        while let Ok(len) = self.file.read(&mut buf) {
-            latest = decode_tracking_report(&buf[..len]).or(latest);
+        loop {
+            match device.file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(len) => latest = decode_tracking_report(&buf[..len]).or(latest),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    // Unplugged: look for a node again right away, the other
+                    // one (headset or dongle) may still be there.
+                    device.present = false;
+                    let message = format!("lost {}: {e}", device.path.display());
+                    self.device = None;
+                    self.last_report = None;
+                    self.next_attempt = now;
+                    self.problem(message);
+                    return None;
+                }
+            }
         }
-        let q = latest?;
+        let Some(q) = latest else {
+            if !was_connected && now >= self.next_attempt {
+                self.next_attempt = now + RETRY;
+                self.restart_stream();
+            }
+            return None;
+        };
+        if !was_connected {
+            // A new stream: the headset may have been off, its frame is not the old one.
+            eprintln!("head tracking data coming from {}", device.path.display());
+            self.reference = None;
+            self.last_problem = None;
+        }
+        self.last_report = Some(now);
+        self.next_attempt = now + STALE;
         Some(headset_to_head(*self.reference.get_or_insert(q), q))
+    }
+
+    fn connected(&self) -> bool {
+        self.last_report.is_some_and(|t| t.elapsed() < STALE)
     }
 }
 
@@ -187,14 +342,6 @@ fn decode_tracking_report(report: &[u8]) -> Option<Quat> {
 fn headset_to_head(reference: Quat, q: Quat) -> Quat {
     let r = reference.conjugate().mul(q);
     Quat { w: r.w, x: r.z, y: r.y, z: -r.x }
-}
-
-impl Drop for MaxwellHid {
-    fn drop(&mut self) {
-        if let Err(e) = self.write_register(TRACKING_OFF) {
-            eprintln!("could not switch Maxwell head tracking off: {e}");
-        }
-    }
 }
 
 #[cfg(test)]

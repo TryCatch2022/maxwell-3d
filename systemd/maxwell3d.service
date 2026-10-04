@@ -1,0 +1,30 @@
+# Head tracking for the Maxwell 3D spatial sink. A user service: it starts at
+# login, with the user's PipeWire. Installed by install.sh into
+# ~/.config/systemd/user/.
+#
+#   systemctl --user status maxwell3d         state and recent log
+#   journalctl --user -u maxwell3d -f         follow the log
+#   systemctl --user kill -s USR1 maxwell3d   re-centre (make this heading front)
+#   systemctl --user kill -s USR2 maxwell3d   switch head tracking off / on
+#
+# Other options (--smoothing, --deadband, ...): `systemctl --user edit maxwell3d`
+# and override ExecStart (an empty `ExecStart=` line first).
+
+[Unit]
+Description=Head tracking for the Maxwell 3D spatial sink
+After=pipewire.service
+Wants=pipewire.service
+
+[Service]
+Type=notify
+ExecStart=%h/.local/bin/maxwell3d --source maxwell
+# The daemon waits for the headset and reconnects to PipeWire by itself;
+# this covers crashes and a hung main loop (the watchdog).
+Restart=on-failure
+RestartSec=2
+WatchdogSec=10
+# 2: bad arguments, 3: another instance is running. Restarting won't help.
+RestartPreventExitStatus=2 3
+
+[Install]
+WantedBy=default.target
