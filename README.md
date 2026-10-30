@@ -34,11 +34,13 @@ Then choose "Maxwell 3D (7.1 spatial)" as the output and play surround audio:
 
     systemctl --user status maxwell3d          # what it's doing ("tracking", "waiting for the head tracker", ...)
     journalctl --user -u maxwell3d -f          # its log
-    systemctl --user kill -s USR1 maxwell3d    # re-centre: the current heading becomes "front"
+    systemctl --user kill -s USR1 maxwell3d    # re-centre: the current pose becomes "front, level"
     systemctl --user kill -s USR2 maxwell3d    # head tracking off / on
 
 The two signal commands are worth binding to hotkeys (`pkill -USR1 -x maxwell3d`
-does the same). Re-centring only resets the heading; pitch and roll are kept.
+does the same). Re-centre while looking straight ahead with your head level: the
+whole pose is reset, since the headset's notion of "level" is just however it
+sat when tracking started.
 Small heading drift is corrected automatically (`--auto-recenter`, below).
 With tracking off the speakers go back to their fixed positions around your head.
 
@@ -142,7 +144,7 @@ OpenTrack UDP packets (so a real OpenTrack install can be used instead):
 The face landmarker model is downloaded next to the script on first run. Look
 straight ahead when starting the tracker: the first pose is "front". `pkill -USR1 -f
 webcam_tracker.py` re-centres all three axes (useful when the camera is above
-the screen), `pkill -USR1 maxwell3d` re-centres the heading only.
+the screen), `pkill -USR1 maxwell3d` does the same in maxwell3d.
 
 ### Head tracking from the Maxwell
 

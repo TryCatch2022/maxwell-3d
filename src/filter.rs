@@ -59,10 +59,13 @@ impl HeadFilter {
         }
     }
 
-    /// Make the next orientation received the forward direction.
+    /// Make the next orientation received the forward, level direction.
     ///
-    /// Only the heading is reset: trackers get pitch and roll from gravity, so
-    /// those do not drift, while the heading does.
+    /// The whole pose is reset, not just the heading: the Maxwell's frame is
+    /// not tied to gravity (its "level" is however the headset sat when the
+    /// stream started), so keeping its pitch and roll would leave front tilted,
+    /// and a tilted front puts the speakers off to one side by an amount that
+    /// depends on where you face when re-centring.
     pub fn recenter(&mut self) {
         self.recenter_pending = true;
     }
@@ -77,7 +80,7 @@ impl HeadFilter {
     /// Feed a raw orientation, `dt` seconds after the previous one.
     pub fn update(&mut self, raw: Quat, dt: f64) -> Quat {
         if std::mem::take(&mut self.recenter_pending) {
-            self.reference = Quat::from_euler_deg(raw.yaw_deg(), 0.0, 0.0);
+            self.reference = raw;
             self.drift = 0.0;
         }
         self.correct_drift(raw, dt);
@@ -155,6 +158,7 @@ impl HeadFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orientation::Direction;
 
     #[test]
     fn first_sample_becomes_forward() {
@@ -164,14 +168,20 @@ mod tests {
     }
 
     #[test]
-    fn recenter_keeps_pitch() {
+    fn recenter_levels_a_tilted_frame() {
+        // The stream started with the headset tilted, so looking level reads
+        // as pitched and rolled, by amounts that vary with the heading.
+        let start = Quat::from_euler_deg(0.0, 20.0, 25.0);
         let mut f = HeadFilter::new(0.0, 0.0);
-        f.update(Quat::IDENTITY, 0.01);
-        f.recenter();
-        let q = f.update(Quat::from_euler_deg(90.0, 20.0, 0.0), 0.01);
-        let expected = Quat::from_euler_deg(0.0, 20.0, 0.0);
-        let dot = q.w * expected.w + q.x * expected.x + q.y * expected.y + q.z * expected.z;
-        assert!((dot.abs() - 1.0).abs() < 1e-9, "{q:?}");
+        for facing in [0.0, 60.0, 90.0, 180.0] {
+            f.recenter();
+            let looking = |yaw: f64| start.conjugate().mul(Quat::from_euler_deg(facing + yaw, 0.0, 0.0));
+            f.update(looking(0.0), 0.01);
+            let front = Direction { azimuth: 0.0, elevation: 0.0 }.relative_to(f.update(looking(0.0), 0.01));
+            assert!(front.azimuth.min(360.0 - front.azimuth) < 1e-6, "{facing}: {front:?}");
+            assert!(front.elevation.abs() < 1e-6, "{facing}: {front:?}");
+            assert!((f.update(looking(40.0), 0.01).yaw_deg() - 40.0).abs() < 1e-6, "{facing}");
+        }
     }
 
     #[test]
